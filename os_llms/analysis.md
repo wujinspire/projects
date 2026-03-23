@@ -1,5 +1,49 @@
 # Open-Source LLM Architecture Notes
 
+## Summary Table
+
+Representative-model comparison only.
+
+| Model / representative | Type                            | Params (total / active)                             | Layers                    | Experts                                | Attention                                   | Norm                                       | Context        | Key features                                                                  | Detail score |
+| ---------------------- | ------------------------------- | --------------------------------------------------- | ------------------------- | -------------------------------------- | ------------------------------------------- | ------------------------------------------ | -------------- | ----------------------------------------------------------------------------- | ------------ |
+| DeepSeek V3            | MoE                             | 671B / 37B                                          | 61 = 3 dense + 58 MoE     | 1 shared + 256 routed; 8 active        | MLA                                         | RMSNorm                                    | 128K           | FP8 training, auxiliary-loss-free load balancing, MTP depth = 1               | 100%         |
+| DeepSeek V3.2          | Delta report over V3.1-Terminus | Not fully restated in the delta report              | Not explicitly specified  | Not explicitly specified               | DSA under MLA, MQA-mode kernel              | Not explicitly specified                   | 128K           | Continued pre-training, dense warm-up + sparse adaptation, Keep Routing in RL | 60%          |
+| Qwen3-235B-A22B        | MoE                             | 235B / 22B                                          | 94                        | 128 total; 8 active; no shared experts | GQA                                         | RMSNorm, pre-norm                          | 128K           | QK-Norm, no QKV bias, ABF + YARN + DCA                                        | 95%          |
+| Qwen3.5-397B-A17B      | Multimodal MoE                  | 397B / 17B                                          | 60                        | 512 total; 10 routed + 1 shared        | Gated DeltaNet + Gated Attention            | Not explicitly specified                   | 262,144 / 1.01M | Hybrid linear-attention stack, multimodal, multi-step MTP, default thinking   | 85%          |
+| Gemma 3 27B            | Dense; mostly multimodal family | 27B / -                                             | Not explicitly specified  | -                                      | GQA with 5:1 local/global attention         | RMSNorm; pre- and post-norm both mentioned | 128K           | QK-norm, SigLIP vision encoder, local/global interleaving                     | 75%          |
+| gpt-oss-120b           | MoE                             | 116.83B / 5.13B                                     | 36                        | 128 total; top-4 active                | GQA with alternating banded/dense attention | RMSNorm, Pre-LN                            | 131,072        | MXFP4 MoE quantization, learned attention sink bias                           | 80%          |
+| Llama 3.1 405B         | Dense                           | 405B / -                                            | 126                       | -                                      | GQA                                         | Not explicitly specified                   | 128K           | RoPE theta = 500,000, 128K vocab                                              | 70%          |
+| Ministral 3 14B        | Dense multimodal                | 14B / -                                             | 40                        | -                                      | GQA                                         | RMSNorm                                    | up to 256K     | YaRN, position-based softmax temperature scaling, frozen ViT encoder          | 75%          |
+| GLM-4.5                | MoE                             | 355B / 32B                                          | 3 dense + 89 MoE (+1 MTP) | 160 total; 8 active; 1 shared          | GQA with partial RoPE                       | Not explicitly specified                   | 131,072        | QK-Norm, loss-free balance routing, MTP                                       | 90%          |
+| GLM-5                  | MoE                             | 744B / 40B                                          | 3 dense + 75 MoE (+1 MTP) | 256 total; 8 routed; 1 shared          | MLA + DSA                                   | Not explicitly specified                   | 200K / 202,752 | Indexer heads, Q/KV LoRA dims, long-context focus                             | 90%          |
+| Kimi K2                | MoE                             | 1.04T / 32.6B                                       | 61                        | 384 total; 8 active; 1 shared          | MLA                                         | Not explicitly specified                   | 128K           | MuonClip, QK-Clip, only 1 dense layer                                         | 90%          |
+| Kimi K2.5              | Multimodal system               | Full system not fully restated; K2 backbone = 1.04T / 32B | Not explicitly specified  | Not explicitly specified               | MoonViT-3D + K2 backbone                    | Not explicitly specified                   | 256K / 262,144 | Visual agentic stack, NaViT-style packing, Agent Swarm / PARL                 | 65%          |
+
+## Cross-Model Takeaways
+
+- Attention choice: `GQA` is the default in many dense or moderately sparse open models here (`Qwen 3`, `Gemma 3`, `Llama 3.1`, `Ministral 3`, `GLM-4.5`), while `MLA` is favored by several frontier MoE designs (`DeepSeek V3`, `GLM-5`, `Kimi K2`) to reduce KV-cache cost.
+- Attention evolution: long-context improvements are often added on top of a base attention choice rather than replacing the whole stack, e.g. `DSA` over `MLA`, local/global interleaving over `GQA`, banded attention over dense attention, and inference extensions such as `YaRN`, `ABF`, or `DCA`.
+- Hybrid frontier trend: `Qwen 3.5` shows a different path from plain `GQA` or `MLA`, combining `Gated DeltaNet` with sparse MoE and a smaller gated-attention component in a single multimodal stack.
+- Norm choice: `RMSNorm` is the dominant normalization choice across almost all families in this set; when reports are explicit, modern stacks usually use pre-norm-like layouts or add extra normalization around attention internals.
+- Attention stabilization: several families add explicit Q/K-side stabilization instead of changing the full block design, e.g. `QK-Norm` in `Qwen 3`, `Gemma 3`, and `GLM-4.5`, plus `QK-Clip` in `Kimi K2`.
+- MoE choice: the largest open frontier models in this set mostly adopt `MoE` to push total parameter count up while keeping activated parameters per token much lower than total parameters.
+- Common MoE pattern: a small number of dense layers is often kept near the bottom of the stack, then most later layers use routed experts; many reports converge around `top-8` routed or active experts, sometimes with `1 shared expert`.
+- Dense-model tradeoff: dense families (`Llama 3.1`, much of `Gemma 3`, `Ministral 3`) expose fewer routing knobs and are easier to summarize architecturally, but they usually scale active compute linearly with model size instead of using sparse activation.
+- Multimodal trend: multimodal systems in this collection usually keep the language backbone mostly intact and add a frozen or separately trained vision encoder plus a projector, instead of redesigning the core Transformer from scratch.
+
+## Tunable Parameters
+
+- In this note, `tunable parameters` means architecture and system knobs that model designers can choose or sweep, not the full set of trainable weights.
+- Backbone scale knobs: number of layers, hidden dimension, FFN/intermediate dimension, vocabulary size, and whether embeddings are tied.
+- Attention knobs: attention type (`GQA`, `MLA`, local/global, banded, `DSA`), query-head count, KV-head count, per-head dimension, compression dimensions, and any indexer or latent-attention sub-dimensions.
+- Positional / context knobs: context length, RoPE base frequency or theta, local attention window size, local/global layer ratio, and long-context extension method such as `YaRN`, `ABF`, or `DCA`.
+- MoE knobs: number of experts, number of routed experts per token, number of shared experts, expert hidden dimension, number of dense vs MoE layers, grouping / routing constraints, and load-balancing strategy.
+- Routing knobs: top-k value, sigmoid vs other gate details, node limits, auxiliary-loss vs auxiliary-loss-free balancing, and whether routing paths are kept fixed in special training stages.
+- Extra-module knobs: `MTP` depth, LoRA-style compression dimensions, indexer heads for sparse attention, projector size for multimodal models, and vision-token compression settings.
+- System-level knobs: which backbone is frozen or reused, whether the vision encoder is frozen, sequence packing strategy, temporal pooling / compression, and how agent or tool-use components are layered on top of the base LLM.
+
+## Details
+
 This document records architecture facts conservatively from the technical reports already collected in `os_llms/`.
 
 Working rules:
@@ -347,45 +391,3 @@ Working rules:
 - Context length: sequence lengths of 32,768 to 262,144 appear in the training setup; 256K is the practical headline context
 - Training / system notes: large-scale visual-text joint pre-training; Agent Swarm / PARL style orchestration for agentic behavior
 - Extra notes: this report is more about the multimodal and agentic stack than a full reprint of the K2 backbone specification
-
-## Summary Table
-
-Representative-model comparison only.
-
-| Model / representative | Type                            | Params (total / active)                             | Layers                    | Experts                                | Attention                                   | Norm                                       | Context        | Key features                                                                  | Detail score |
-| ---------------------- | ------------------------------- | --------------------------------------------------- | ------------------------- | -------------------------------------- | ------------------------------------------- | ------------------------------------------ | -------------- | ----------------------------------------------------------------------------- | ------------ |
-| DeepSeek V3            | MoE                             | 671B / 37B                                          | 61 = 3 dense + 58 MoE     | 1 shared + 256 routed; 8 active        | MLA                                         | RMSNorm                                    | 128K           | FP8 training, auxiliary-loss-free load balancing, MTP depth = 1               | 100%         |
-| DeepSeek V3.2          | Delta report over V3.1-Terminus | Not fully restated in the delta report              | Not explicitly specified  | Not explicitly specified               | DSA under MLA, MQA-mode kernel              | Not explicitly specified                   | 128K           | Continued pre-training, dense warm-up + sparse adaptation, Keep Routing in RL | 60%          |
-| Qwen3-235B-A22B        | MoE                             | 235B / 22B                                          | 94                        | 128 total; 8 active; no shared experts | GQA                                         | RMSNorm, pre-norm                          | 128K           | QK-Norm, no QKV bias, ABF + YARN + DCA                                        | 95%          |
-| Qwen3.5-397B-A17B      | Multimodal MoE                  | 397B / 17B                                          | 60                        | 512 total; 10 routed + 1 shared        | Gated DeltaNet + Gated Attention            | Not explicitly specified                   | 262,144 / 1.01M | Hybrid linear-attention stack, multimodal, multi-step MTP, default thinking   | 85%          |
-| Gemma 3 27B            | Dense; mostly multimodal family | 27B / -                                             | Not explicitly specified  | -                                      | GQA with 5:1 local/global attention         | RMSNorm; pre- and post-norm both mentioned | 128K           | QK-norm, SigLIP vision encoder, local/global interleaving                     | 75%          |
-| gpt-oss-120b           | MoE                             | 116.83B / 5.13B                                     | 36                        | 128 total; top-4 active                | GQA with alternating banded/dense attention | RMSNorm, Pre-LN                            | 131,072        | MXFP4 MoE quantization, learned attention sink bias                           | 80%          |
-| Llama 3.1 405B         | Dense                           | 405B / -                                            | 126                       | -                                      | GQA                                         | Not explicitly specified                   | 128K           | RoPE theta = 500,000, 128K vocab                                              | 70%          |
-| Ministral 3 14B        | Dense multimodal                | 14B / -                                             | 40                        | -                                      | GQA                                         | RMSNorm                                    | up to 256K     | YaRN, position-based softmax temperature scaling, frozen ViT encoder          | 75%          |
-| GLM-4.5                | MoE                             | 355B / 32B                                          | 3 dense + 89 MoE (+1 MTP) | 160 total; 8 active; 1 shared          | GQA with partial RoPE                       | Not explicitly specified                   | 131,072        | QK-Norm, loss-free balance routing, MTP                                       | 90%          |
-| GLM-5                  | MoE                             | 744B / 40B                                          | 3 dense + 75 MoE (+1 MTP) | 256 total; 8 routed; 1 shared          | MLA + DSA                                   | Not explicitly specified                   | 200K / 202,752 | Indexer heads, Q/KV LoRA dims, long-context focus                             | 90%          |
-| Kimi K2                | MoE                             | 1.04T / 32.6B                                       | 61                        | 384 total; 8 active; 1 shared          | MLA                                         | Not explicitly specified                   | 128K           | MuonClip, QK-Clip, only 1 dense layer                                         | 90%          |
-| Kimi K2.5              | Multimodal system               | Full system not fully restated; K2 backbone = 1.04T / 32B | Not explicitly specified  | Not explicitly specified               | MoonViT-3D + K2 backbone                    | Not explicitly specified                   | 256K / 262,144 | Visual agentic stack, NaViT-style packing, Agent Swarm / PARL                 | 65%          |
-
-## Cross-Model Takeaways
-
-- Attention choice: `GQA` is the default in many dense or moderately sparse open models here (`Qwen 3`, `Gemma 3`, `Llama 3.1`, `Ministral 3`, `GLM-4.5`), while `MLA` is favored by several frontier MoE designs (`DeepSeek V3`, `GLM-5`, `Kimi K2`) to reduce KV-cache cost.
-- Attention evolution: long-context improvements are often added on top of a base attention choice rather than replacing the whole stack, e.g. `DSA` over `MLA`, local/global interleaving over `GQA`, banded attention over dense attention, and inference extensions such as `YaRN`, `ABF`, or `DCA`.
-- Hybrid frontier trend: `Qwen 3.5` shows a different path from plain `GQA` or `MLA`, combining `Gated DeltaNet` with sparse MoE and a smaller gated-attention component in a single multimodal stack.
-- Norm choice: `RMSNorm` is the dominant normalization choice across almost all families in this set; when reports are explicit, modern stacks usually use pre-norm-like layouts or add extra normalization around attention internals.
-- Attention stabilization: several families add explicit Q/K-side stabilization instead of changing the full block design, e.g. `QK-Norm` in `Qwen 3`, `Gemma 3`, and `GLM-4.5`, plus `QK-Clip` in `Kimi K2`.
-- MoE choice: the largest open frontier models in this set mostly adopt `MoE` to push total parameter count up while keeping activated parameters per token much lower than total parameters.
-- Common MoE pattern: a small number of dense layers is often kept near the bottom of the stack, then most later layers use routed experts; many reports converge around `top-8` routed or active experts, sometimes with `1 shared expert`.
-- Dense-model tradeoff: dense families (`Llama 3.1`, much of `Gemma 3`, `Ministral 3`) expose fewer routing knobs and are easier to summarize architecturally, but they usually scale active compute linearly with model size instead of using sparse activation.
-- Multimodal trend: multimodal systems in this collection usually keep the language backbone mostly intact and add a frozen or separately trained vision encoder plus a projector, instead of redesigning the core Transformer from scratch.
-
-## Tunable Parameters
-
-- In this note, `tunable parameters` means architecture and system knobs that model designers can choose or sweep, not the full set of trainable weights.
-- Backbone scale knobs: number of layers, hidden dimension, FFN/intermediate dimension, vocabulary size, and whether embeddings are tied.
-- Attention knobs: attention type (`GQA`, `MLA`, local/global, banded, `DSA`), query-head count, KV-head count, per-head dimension, compression dimensions, and any indexer or latent-attention sub-dimensions.
-- Positional / context knobs: context length, RoPE base frequency or theta, local attention window size, local/global layer ratio, and long-context extension method such as `YaRN`, `ABF`, or `DCA`.
-- MoE knobs: number of experts, number of routed experts per token, number of shared experts, expert hidden dimension, number of dense vs MoE layers, grouping / routing constraints, and load-balancing strategy.
-- Routing knobs: top-k value, sigmoid vs other gate details, node limits, auxiliary-loss vs auxiliary-loss-free balancing, and whether routing paths are kept fixed in special training stages.
-- Extra-module knobs: `MTP` depth, LoRA-style compression dimensions, indexer heads for sparse attention, projector size for multimodal models, and vision-token compression settings.
-- System-level knobs: which backbone is frozen or reused, whether the vision encoder is frozen, sequence packing strategy, temporal pooling / compression, and how agent or tool-use components are layered on top of the base LLM.
